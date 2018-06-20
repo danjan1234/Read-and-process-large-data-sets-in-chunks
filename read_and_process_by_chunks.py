@@ -19,12 +19,9 @@ def dummyFunc(chunkID, df):
             frame object pair. The data frame name is used to name the summary
             report to be saved
     """
-    return {"dummy_result": pd.DataFrame()}
+    return {"dummy_result": pd.DataFrame(data=[1], columns=['a'])}
     
 def countRows(chunkID, df):
-    """
-    Just count the number of rows in each chunk
-    """
     sumDf = pd.DataFrame.from_dict({'chunk_size': [len(df)]})
     return {"summary_number_rows": sumDf}
 
@@ -45,7 +42,7 @@ class ReadAndProcessByChunks(object):
     
     def __init__(self, filePath, sep=',', columnTypes=None, chunkSize=1000, 
                     kwargs={}, nBufferedChunks=10, nJobs=None, func=None, 
-                    testRun=False, warning=False):
+                    testRun=False):
         """
         Arguments:
             filePath: str
@@ -176,14 +173,50 @@ class ReadAndProcessByChunks(object):
         self._collectResults()
         print("Total runtime: {:.0f} s".format(time.time() - _startTime))
     
-    def save(self, filePath, sep='\t'):
+    def save(self, filePath, sep='\t', fileType='hdf'):
         """
         Arguments:
             filePath: file path to save the summary files
+            fileType: the type of files to be saved. Options: 'txt', 'hdf'
         """
-        for key in self._rlt:
+        for i, key in enumerate(self._rlt):
             df = self._rlt[key]
-            df.to_csv(filePath[:-4] + '_{}.txt'.format(key), sep='\t')
+            if fileType == 'txt':
+                df.to_csv(filePath[:-4] + '_{}.txt'.format(key), sep='\t')
+            else:
+                mode = 'w' if i == 0 else 'a'
+                df.to_hdf(filePath[:-4] + '_{}.h5'.format(key), key=key, 
+                                format='fixed', mode=mode)
  
 if __name__ == '__main__':
-    pass
+    # A test run
+    filePath = r'C:\Users\justin.duan\Documents\Projects\Chip data\RH test\RHsweeps 8kOe.csv'
+    sep, chunkSize = ',', 187200
+    # Do not use 'category' as there is a problem with concatenating
+    columnTypes = { 'TestDate': 'object',
+                    'CHIP': 'object',
+                    'uMoveX': 'int32',
+                    'uMoveY': 'int32',
+                    'Test': 'object',
+                    'Row': 'int32',
+                    'Y': 'int32',
+                    'Bank': 'int32',
+                    'Col': 'int32',
+                    'Output': 'int32',
+                    'WriteData': 'int32',
+                    'VBL': 'float32',
+                    'VWL': 'float32',
+                    'WriteVoltage': 'float32',
+                    'ResetTWP': 'int32',
+                    'WriteTWP': 'int32',
+                    'Cycles': 'int32',
+                    'Passed': 'int32',
+                    'Reset Fail': 'int32',
+                    'Backhop': 'int32',
+                    'Write Fail': 'int32',
+                    'WER': 'float32'}
+    s = ReadAndProcessByChunks(filePath, sep=sep, columnTypes=columnTypes,
+                    chunkSize=chunkSize, nBufferedChunks=20,
+                    nJobs=None, func=countRows, testRun=False)
+    s.run()
+    s.save(filePath)
