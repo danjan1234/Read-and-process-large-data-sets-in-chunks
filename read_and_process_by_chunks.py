@@ -7,6 +7,7 @@ Author: Justin Duan
 
 import time
 import pandas as pd
+import numpy as np
 from multiprocessing import Process, Manager, cpu_count
 from threading import Thread
 
@@ -22,7 +23,7 @@ def dummyFunc(chunkID, df):
     return {"dummy_result": pd.DataFrame(data=[1], columns=['a'])}
     
 def countRows(chunkID, df):
-    sumDf = pd.DataFrame.from_dict({'chunk_size': [len(df)]})
+    sumDf = pd.DataFrame.from_dict({'chunk_size': [len(df)], 'min_row': [df.index.min()]})
     return {"summary_number_rows": sumDf}
 
     
@@ -40,15 +41,16 @@ class ReadAndProcessByChunks(object):
     """
     STOP_FLAG = 'STOP'
     
-    def __init__(self, filePath, sep=',', columnTypes=None, chunkSize=1000, 
-                    kwargs={}, nBufferedChunks=10, nJobs=None, func=None, 
-                    testRun=False):
+    def __init__(self, filePath, sep=',', header='infer', columnTypes=None, 
+                    chunkSize=1000, splitBy=None, kwargs={}, 
+                    nBufferedChunks=10, nJobs=None, func=None, testRun=False):
         """
         Arguments:
             filePath: str
                 The full path to the file to analysize
             sep: str, default ','
                 Delimiter between the fields
+            header: same as header argument in pd.read_csv
             columnTypes: dict, default None
                 A dictionary that specifies the data types of columns. This 
                 parameter is passed to dtype argument of pd.read_csv. Note, due
@@ -58,6 +60,15 @@ class ReadAndProcessByChunks(object):
                 be specified
             chunkSize: int
                 The number of rows per chunk to read
+            splitBy: column name, default=None
+                If specified, two read passes will be performed -- the first
+                pass still reads the file in by input chunk size, the script
+                creates a summary about the number of rows and order for each 
+                unique splitBy column values. After the first read pass finishes,
+                an overall summary is created which serves as the guideline for
+                the second read pass. This parameter ensures the complete set
+                of data with the same splitBy column values are read as one 
+                single chunk 
             kwargs: dict, default {}
                 Keyword argument to pass to pd.read_csv
             nBufferedChunks: int
@@ -77,17 +88,61 @@ class ReadAndProcessByChunks(object):
         # Memorize the settings
         self._filePath = filePath
         self._sep = sep
+        self._header = header
         self._columnTypes = columnTypes
         self._chunkSize = chunkSize
+        self._splitBy = splitBy
         self._nBufferedChunks = nBufferedChunks
         self._kwargs = kwargs
         self._nJobs = cpu_count() - 1 if nJobs is None else nJobs
         self._func = func
         self._testRun = testRun
     
+    def _summarizeByColumn(self, df):
+        df.reset_index(inplace=True)
+        df = pd.pivot_table(df, index=self._splitBy, values='index', 
+                                                aggfunc=(len, min))
+        return df
+    
+    def _merge(self, dfs):
+        if dfs is None or len(dfs) == 0:
+            return
+        
+        return self._mergeHelper(dfs, 0, len(dfs) - 1)
+    
+    def _mergeHelper(self, dfs, start, end):
+        if start == end:
+            return dfs[start]
+        
+        mid = start + (end - start) // 2
+        left = self._mergeHelper(dfs, start, mid)
+        right = self._mergeHelper(dfs, mid + 1, end)
+        return self._mergeTwo(left, right)
+    
+    def _mergeTwo(self, left, right):
+        df = pd.merge(left, right, how='outer', left_index=True, 
+                                right_index=True, suffixes=('_l', '_r'))
+        df[['len_l', 'len_r']] = df[['len_l', 'len_r']].fillna(0)
+        df[['min_l', 'min_r']] = df[['min_l', 'min_r']].fillna(float('inf'))
+        df['len'] = df['len_l'] + df['len_r']
+        df['min'] = np.minimum(df['min_l'], df['min_r'])
+        return df[['len', 'min']].astype(np.intc)
+    
     def _createChunks(self):
         self._chunks = pd.read_csv(self._filePath, chunksize=self._chunkSize,
-                        sep=self._sep, dtype=self._columnTypes, **self._kwargs)
+                        sep=self._sep, header=self._header, 
+                        dtype=self._columnTypes, **self._kwargs)
+        if self._splitBy is not None:
+            print("Build a summary based on the split by column ...")
+            dfs = []
+            for chunk in self._chunks:
+                df = self._summarizeByColumn(chunk)
+                dfs.append(df)
+            self._splitBySumDf = self._merge(dfs)
+            self._splitBySumDf.sort_values(by='min', inplace=True)
+            self._reader = pd.read_csv(self._filePath, iterator=True,
+                        sep=self._sep, header=self._header, 
+                        dtype=self._columnTypes, **self._kwargs)
     
     def _createReaderThread(self):
         self._th = Thread(target=self._readChunksToQueue)
@@ -95,12 +150,20 @@ class ReadAndProcessByChunks(object):
     
     def _readChunksToQueue(self):
         stopFlag = self.STOP_FLAG
-        for chunkID, chunk in enumerate(self._chunks):
-            while self._chunkQueue.qsize() >= self._nBufferedChunks:
-                time.sleep(0.01)
-            self._chunkQueue.put((chunkID, chunk))
-            if self._testRun:
-                break
+        if self._splitBy is None:
+            for chunkID, chunk in enumerate(self._chunks):
+                while self._chunkQueue.qsize() >= self._nBufferedChunks:
+                    time.sleep(0.01)
+                self._chunkQueue.put((chunkID, chunk))
+                if self._testRun:
+                    break
+        else:
+            for chunkID, chunkSize in enumerate(self._splitBySumDf['len']):
+                while self._chunkQueue.qsize() >= self._nBufferedChunks:
+                    time.sleep(0.01)
+                self._chunkQueue.put((chunkID, self._reader.get_chunk(chunkSize)))
+                if self._testRun:
+                    break
         for _ in range(self._nJobs):
             self._chunkQueue.put(stopFlag)
                             
@@ -173,7 +236,7 @@ class ReadAndProcessByChunks(object):
         self._collectResults()
         print("Total runtime: {:.0f} s".format(time.time() - _startTime))
     
-    def save(self, filePath, sep='\t', fileType='hdf'):
+    def save(self, filePath, sep='\t', fileType='txt'):
         """
         Arguments:
             filePath: file path to save the summary files
@@ -190,33 +253,10 @@ class ReadAndProcessByChunks(object):
  
 if __name__ == '__main__':
     # A test run
-    filePath = r'C:\Users\justin.duan\Documents\Projects\Chip data\RH test\RHsweeps 8kOe.csv'
+    filePath = r'C:\Users\justin.duan\Documents\Projects\Chip data\WER test 2\MPW8FastWER100K_180620_60_sites_2D_18addrs_1E-5.csv'
     sep, chunkSize = ',', 187200
-    # Do not use 'category' as there is a problem with concatenating
-    columnTypes = { 'TestDate': 'object',
-                    'CHIP': 'object',
-                    'uMoveX': 'int32',
-                    'uMoveY': 'int32',
-                    'Test': 'object',
-                    'Row': 'int32',
-                    'Y': 'int32',
-                    'Bank': 'int32',
-                    'Col': 'int32',
-                    'Output': 'int32',
-                    'WriteData': 'int32',
-                    'VBL': 'float32',
-                    'VWL': 'float32',
-                    'WriteVoltage': 'float32',
-                    'ResetTWP': 'int32',
-                    'WriteTWP': 'int32',
-                    'Cycles': 'int32',
-                    'Passed': 'int32',
-                    'Reset Fail': 'int32',
-                    'Backhop': 'int32',
-                    'Write Fail': 'int32',
-                    'WER': 'float32'}
-    s = ReadAndProcessByChunks(filePath, sep=sep, columnTypes=columnTypes,
-                    chunkSize=chunkSize, nBufferedChunks=20,
+    s = ReadAndProcessByChunks(filePath, sep=sep, splitBy="CHIP",
+                    chunkSize=chunkSize, header=2, nBufferedChunks=20,
                     nJobs=None, func=countRows, testRun=False)
     s.run()
     s.save(filePath)
