@@ -4,7 +4,7 @@ simultaneously by chunks
 
 Author: Justin Duan
 """
-
+import os
 import time
 import pandas as pd
 import numpy as np
@@ -45,11 +45,12 @@ class ReadProcessByChunks(object):
 
     def __init__(self, file_path, binary=False, sep=',', header='infer', column_types=None,
                  chunk_size=1000, split_by=None, kwargs={},
-                 n_buffered_chunks=10, n_jobs=None, func=None, test_run=False):
+                 n_buffered_chunks=10, n_jobs=None, func=None, func_kwargs={}, test_run=False):
         """
         Arguments:
             file_path: str, text or binary file
-                The full path to the file to analyze
+                File path or directory. Note if a directory is passed in, all files
+                within this directory will be processed
             binary: bool, default=False
                 Determine if the input file is binary
             sep: str, default ','
@@ -85,11 +86,12 @@ class ReadProcessByChunks(object):
                 have two inputs: the chunk_id and chunk reference. The return 
                 value of func must be a dictionary with keys being the dataframe
                 names and values being the data frame objects
+            func_kwargs: dict, default={}
+                Keywords to pass to the processing function
             test_run: boolean, default False
                 If True, then only the first chunk will be analyzed. This
                 feature is good for debugging purpose
         """
-        self._start_time = time.time()
 
         # Memorize the settings
         self._file_path = file_path
@@ -103,6 +105,7 @@ class ReadProcessByChunks(object):
         self._kwargs = kwargs
         self._n_jobs = cpu_count() - 1 if n_jobs is None else n_jobs
         self._func = func
+        self._func_kwargs = func_kwargs
         self._test_run = test_run
 
     def head(self, n_lines=10):
@@ -150,15 +153,26 @@ class ReadProcessByChunks(object):
         return df[['len', 'min']].astype(np.intc)
 
     def _create_chunks(self):
-        if self._binary:
-            self._create_chunks_binary()
+        if os.path.isdir(self._file_path):
+            self._files = os.listdir(self._file_path)
         else:
-            self._create_chunks_text()
+            if self._binary:
+                self._create_chunks_binary()
+            else:
+                self._create_chunks_text()
 
     def _create_chunks_binary(self):
+        """
+        Read the binary file. Note this function does not automatically split it to chunks
+        """
         self._binary_file = open(self._file_path, 'rb')
 
     def _create_chunks_text(self):
+        """
+        Create chunks for the text file. Note if a split-by column is specified. The program will first count
+        the number of rows corresponding to each entry in the split-by column. The correct number of rows will
+        be read during the actual data processing step
+        """
         self._chunks = pd.read_csv(self._file_path, chunksize=self._chunk_size,
                                    sep=self._sep, header=self._header,
                                    dtype=self._column_types, **self._kwargs)
@@ -179,10 +193,31 @@ class ReadProcessByChunks(object):
         self._th.start()
 
     def _read_chunks_to_queue(self):
-        if self._binary:
-            self._read_chunks_to_queue_binary()
+        if os.path.isdir(self._file_path):
+            self._read_single_file_to_queue()
         else:
-            self._read_chunks_to_queue_text()
+            if self._binary:
+                self._read_chunks_to_queue_binary()
+            else:
+                self._read_chunks_to_queue_text()
+
+    def _read_single_file_to_queue(self):
+        stop_flag = self.STOP_FLAG
+        for chunk_id, file in enumerate(self._files):
+            while self._chunk_queue.qsize() >= self._n_buffered_chunks:
+                time.sleep(0.01)
+            file_path = os.path.join(self._file_path, file)
+            if self._binary:
+                with open(file_path, 'rb') as f:
+                    chunk = pd.DataFrame(np.fromfile(f, dtype=self._column_types))
+                    self._chunk_queue.put((file, chunk))
+            else:
+                chunk = pd.read_csv(file_path, sep=self._sep, header=self._header, dtype=self._column_types, **self._kwargs)
+                self._chunk_queue.put((file, chunk))    # Put file name in queue instead of chunk_id
+            if self._test_run:
+                break
+        for _ in range(self._n_jobs):
+            self._chunk_queue.put(stop_flag)
 
     def _read_chunks_to_queue_text(self):
         stop_flag = self.STOP_FLAG
@@ -234,13 +269,14 @@ class ReadProcessByChunks(object):
                 'process_id': i,
                 'stop_flag': self.STOP_FLAG,
                 'func': self._func,
+                'func_kwargs': self._func_kwargs,
                 'chunk_queue': self._chunk_queue,
                 'result_queue': self._result_queue})
             self._processes.append(proc)
             proc.start()
 
     @classmethod
-    def _process_queue(cls, process_id, stop_flag, func, chunk_queue, result_queue):
+    def _process_queue(cls, process_id, stop_flag, func, func_kwargs, chunk_queue, result_queue):
         while True:
             if chunk_queue.qsize() <= 0:
                 time.sleep(0.01)
@@ -252,7 +288,7 @@ class ReadProcessByChunks(object):
             print("Processing chunk_id = {}".format(chunk_id))
             if func is None:
                 continue
-            data = func(chunk_id, chunk)
+            data = func(chunk_id, chunk, **func_kwargs)
             if data is not None:
                 result_queue.put(data)
         print("Worker {} is done!".format(process_id))
@@ -281,7 +317,8 @@ class ReadProcessByChunks(object):
             self._rlt[key] = pd.concat(val) if len(val) > 0 else pd.DataFrame()
 
         # Close file if necessary
-        self._binary_file.close()
+        if not os.path.isdir(self._file_path):
+            self._binary_file.close()
 
     def run(self):
         """
@@ -289,11 +326,13 @@ class ReadProcessByChunks(object):
 
         :return: None
         """
+        start_time = time.time()
         self._create_chunks()
         self._create_queues()
         self._create_reader_thread()
         self._create_processes()
         self._collect_results()
+        print("Total data processing time: {:.0f} s".format(time.time() - start_time))
 
     def save(self, file_path, sep='\t', file_type='txt', post_process_func=None):
         """
@@ -304,19 +343,23 @@ class ReadProcessByChunks(object):
             file_type: the type of files to be saved. Options: 'txt', 'hdf'
             post_process_func: function to apply on the summary file
         """
+        start_time = time.time()
+        if not os.path.isdir(file_path):
+            file_path = file_path[:-4]
         for i, key in enumerate(self._rlt):
             df = self._rlt[key]
             if post_process_func is not None:
                 df = post_process_func(df)
             if file_type == 'txt':
-                save_path = file_path[:-4] + '_{}.txt'.format(key)
+                save_path = file_path + '_{}.txt'.format(key)
                 df.to_csv(save_path, sep='\t', index=False)
             else:
                 mode = 'w' if i == 0 else 'a'
-                save_path = file_path[:-4] + '_{}.h5'.format(key)
-                df.to_hdf(save_path, key=key, format='table', mode=mode, data_columns=True)
+                save_path = file_path + '_{}.h5'.format(key)
+                df.to_hdf(save_path, key=key, format='fixed', mode=mode)
+                # df.to_hdf(save_path, key=key, format='table', mode=mode, data_columns=True)
             print("Summary file is saved at: {}".format(save_path))
-        print("Total runtime: {:.0f} s".format(time.time() - self._start_time))
+        print("Total data saving time: {:.0f} s".format(time.time() - start_time))
 
 
 if __name__ == '__main__':
