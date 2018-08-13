@@ -3,7 +3,7 @@ A simple workload scheduler that reads and processes large data files
 simultaneously by chunks
 
 Author: Justin Duan
-Time: 2018/07/30 10:48AM
+Time: 2018/08/13 3:10PM
 """
 import os
 import glob
@@ -69,7 +69,7 @@ class ReadProcessByChunks(object):
                 Instead 'object' data type should be specified if a numpy.dtype object is passed, then it assumes the
                 input file is binary. It is used to parse each row of the binary file
             chunk_size: int
-                The number of rows per chunk to read
+                The number of rows per chunk to read. Not used if file_path is a directory
             split_by: column name, default=None
                 If specified, two read passes will be performed -- the first pass still reads the file in by the
                 specified chunk size, the program creates a summary based on this column. It then knows how many rows
@@ -128,6 +128,7 @@ class ReadProcessByChunks(object):
         self._rlt = {}
         self._binary_file = None
         self._log_mode = 'w'
+        self._prev_log_time = time.time()
 
         if not os.path.exists(self._save_path):
             os.makedirs(self._save_path)
@@ -390,6 +391,7 @@ class ReadProcessByChunks(object):
         just_started = True
         mode = 'w'
         initial_write = True
+
         # Keep working if there're any live data analysis processes or any unsaved items in the queue
         while just_started or n_proc_alive > 0 or self._result_queue.qsize() > 0:
             time.sleep(0.01)
@@ -437,7 +439,14 @@ class ReadProcessByChunks(object):
                         msg = "Attn: summary file is saved at: {}".format(file_path)
                         self._log_and_print(self._log_queue, msg)
 
-    def _write_log(self):
+    def _write_log(self, log_interval=10):
+
+        # Skip if the previous save is less than 10s ago
+        curr_time = time.time()
+        if curr_time - self._prev_log_time < log_interval:
+            return
+        self._prev_log_time = curr_time
+
         # Save the logs
         log = []
         while self._log_queue.qsize() > 0:
@@ -457,7 +466,7 @@ class ReadProcessByChunks(object):
         self._log_and_print(self._log_queue, msg)
 
         # Save the log
-        self._write_log()
+        self._write_log(log_interval=0)
 
     @classmethod
     def _log_and_print(cls, log_queue, msg):
