@@ -3,7 +3,7 @@ A simple workload scheduler that reads and processes large data files
 simultaneously by chunks
 
 Author: Justin Duan
-Time: 2018/08/13 3:10PM
+Time: 2018/08/17 11:23AM
 """
 import os
 import glob
@@ -48,9 +48,9 @@ class ReadProcessByChunks(object):
     STOP_FLAG = 'STOP'
 
     def __init__(self, file_path, file_pair_groupby_pattern=None, file_pair_sortby_pattern=None, dtype=None,
-                 chunk_size=1000, split_by=None, kwargs={}, n_buffered_chunks=-1, func=None, func_kwargs={},
-                 keep_rlt=False, post_process_func=None, post_func_kwargs={}, save=True, save_path=None,
-                 n_jobs=-1, test_run=False):
+                 chunk_size=1000, split_by=None, kwargs={}, n_buffered_chunks=-1, n_buffered_results=-1,
+                 func=None, func_kwargs={}, keep_rlt=False, post_process_func=None, post_func_kwargs={},
+                 save=True, save_path=None, hdf_format='table', n_jobs=-1, test_run=False):
         """
         Arguments:
             file_path: str, text or binary file
@@ -79,7 +79,9 @@ class ReadProcessByChunks(object):
             kwargs: dict, default={}
                 Keyword argument to pass to file reading functions
             n_buffered_chunks: int, default=-1
-                The number of buffered chunks. If -1, then a value equals to 2 * n_jobs  is used
+                The number of buffered chunks in memory. If -1, then a value equals to 2 * n_jobs  is used
+            n_buffered_results: int, default=-1
+                The number of buffered results in memory. If -1, then a value equals to 2 * n_jobs  is used
             func: function object to apply to each chunk
                 Note func must only have two inputs: the id and chunk reference. The return value of func must be a
                 dictionary with keys being the DataFrame names and values being the data frame objects
@@ -99,6 +101,8 @@ class ReadProcessByChunks(object):
                 Save the summary results
             save_path: str, default=None
                 File or directory path to save the final summary. If None, then file_path will be used
+            hdf_format: str, options={'fixed', 'table'}, default='fixed'
+                This setting leads to pd.to_hdf's format paramter
             n_jobs: int, default=-1
                 Number of CPU cores to use. If -1, the value is set to number of cores - 1
             test_run: boolean, default False
@@ -117,6 +121,7 @@ class ReadProcessByChunks(object):
         self._kwargs = kwargs
         self._n_jobs = cpu_count() - 1 if n_jobs == -1 else n_jobs
         self._n_buffered_chunks = 2 * self._n_jobs if n_buffered_chunks == -1 else n_buffered_chunks
+        self._n_buffered_results = 2 * self._n_jobs if n_buffered_results == -1 else n_buffered_results
         self._func = func
         self._func_kwargs = func_kwargs
         self._keep_rlt = keep_rlt
@@ -125,6 +130,7 @@ class ReadProcessByChunks(object):
         self._test_run = test_run
         self._save = save
         self._save_path = save_path if save_path is not None else file_path
+        self._hdf_format = hdf_format
         self._rlt = {}
         self._binary_file = None
         self._log_mode = 'w'
@@ -242,9 +248,11 @@ class ReadProcessByChunks(object):
         for id, file_path in enumerate(self._files):
             while self._chunk_queue.qsize() >= self._n_buffered_chunks:
                 time.sleep(0.01)
-            _, file_name = os.path.split(file_path)
+            # Keep last two levels of file paths
+            dir_name, file_name_1 = os.path.split(file_path)
+            _, file_name_2 = os.path.split(dir_name)
             # Combine id and file_name
-            id = "{}, {}".format(id, file_name)
+            id = "{}, {}".format(id, os.path.join(file_name_2, file_name_1))
             chunk = self._read_single_file(file_path)
             if chunk is None:
                 continue
@@ -254,15 +262,13 @@ class ReadProcessByChunks(object):
 
     def _read_file_pairs_to_queue(self):
         file_pairs = self._get_file_pairs()
-        for id, key in enumerate(file_pairs):
+        for key, val in file_pairs.items():
             while self._chunk_queue.qsize() >= self._n_buffered_chunks:
                 time.sleep(0.01)
-            # Combine id and key
-            id = "{}, {}".format(id, key)
             chunk_pairs = []
-            for _, file_path in file_pairs[key]:
+            for id, file_path in val:
                 chunk_pairs.append(self._read_single_file(file_path))
-            self._chunk_queue.put((id, chunk_pairs))
+            self._chunk_queue.put((key, chunk_pairs))
             if self._test_run:
                 break
 
@@ -345,23 +351,25 @@ class ReadProcessByChunks(object):
                 'func_kwargs': self._func_kwargs,
                 'chunk_queue': self._chunk_queue,
                 'result_queue': self._result_queue,
+                'n_buffered_results': self._n_buffered_results,
                 'log_queue': self._log_queue})
             self._processes.append(proc)
             proc.start()
 
     @classmethod
-    def _process_queue(cls, process_id, stop_flag, func, func_kwargs, chunk_queue, result_queue, log_queue):
+    def _process_queue(cls, process_id, stop_flag, func, func_kwargs, chunk_queue, result_queue, n_buffered_results,
+                       log_queue):
         while True:
-            if chunk_queue.qsize() <= 0:
+            if chunk_queue.qsize() <= 0 or result_queue.qsize() > n_buffered_results:
                 time.sleep(0.01)
                 continue
-            msg = "Number of chunks in memory: {}".format(chunk_queue.qsize())
-            cls._log_and_print(log_queue, msg)
             data = chunk_queue.get()
             if data == stop_flag:
                 break
             id, chunk = data
-            msg = "Processing id = {}".format(id)
+            msg = "Processing id = {}. Number of data and result chunks in memory: {}, {}".format(id, 
+                                                                                                  chunk_queue.qsize(), 
+                                                                                                  result_queue.qsize())
             cls._log_and_print(log_queue, msg)
             if func is None:
                 continue
@@ -410,11 +418,16 @@ class ReadProcessByChunks(object):
                 if self._save and self._post_process_func is None:
                     for key in data:
                         if len(data[key]):
-                            file_path = os.path.join(save_path, '{}.h5'.format(key))
+                            slash_pos = key.find('\\')
+                            if slash_pos > 0:
+                                file_path = os.path.join(save_path, '{}.h5'.format(key[slash_pos + 1:]))
+                            else:
+                                file_path = os.path.join(save_path, '{}.h5'.format(key))
                             if os.path.isfile(file_path) and not initial_write:
                                 mode = 'a'
-                            data[key].to_hdf(file_path, key='summary', format='table', mode=mode, data_columns=True,
-                                             append=True)
+                            append = True if self._hdf_format == 'table' else False
+                            data[key].to_hdf(file_path, key='summary', format=self._hdf_format, mode=mode,
+                                             data_columns=True, append=append)
                             initial_write = False
                             msg = "Attn: summary file is saved at: {}".format(file_path)
                             self._log_and_print(self._log_queue, msg)
@@ -435,7 +448,8 @@ class ReadProcessByChunks(object):
                 if self._save:
                     if len(self._rlt[key]):
                         file_path = os.path.join(save_path, '{}.h5'.format(key))
-                        self._rlt[key].to_hdf(file_path, key='summary', format='table', mode='w', data_columns=True)
+                        self._rlt[key].to_hdf(file_path, key='summary', format=self._hdf_format, mode='w',
+                                              data_columns=True)
                         msg = "Attn: summary file is saved at: {}".format(file_path)
                         self._log_and_print(self._log_queue, msg)
 
