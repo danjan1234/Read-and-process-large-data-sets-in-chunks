@@ -3,7 +3,7 @@ A simple workload scheduler that reads and processes large data files
 simultaneously by chunks
 
 Author: Justin Duan
-Time: 2018/08/17 11:23AM
+Time: 2018/08/17 12:01PM
 """
 import os
 import glob
@@ -425,7 +425,7 @@ class ReadProcessByChunks(object):
                                 file_path = os.path.join(save_path, '{}.h5'.format(key))
                             if os.path.isfile(file_path) and not initial_write:
                                 mode = 'a'
-                            append = True if self._hdf_format == 'table' else False
+                            append = True if self._hdf_format == 'table' and '*' not in self._file_path else False
                             data[key].to_hdf(file_path, key='summary', format=self._hdf_format, mode=mode,
                                              data_columns=True, append=append)
                             initial_write = False
