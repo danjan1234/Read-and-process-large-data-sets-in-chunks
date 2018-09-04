@@ -1,83 +1,96 @@
 """
-A simple workload scheduler that reads and processes large data files 
-simultaneously by chunks
+A simple workload scheduler that reads and processes large data files simultaneously by chunks
 
 Author: Justin Duan
-Time: 2018/08/17 12:01PM
+Time: 2018/08/31 3:20PM
 """
+
+import shutil
 import os
-import glob
-import re
 import time
 import pandas as pd
-import numpy as np
 from multiprocessing import Process, Manager, cpu_count
 from threading import Thread
-from datetime import datetime
+from reader import Reader
+from log import Log
 
 
-def dummy_func(id, df):
+# Example: function used to count the number of rows
+def count_rows(df_tuple_list, col_names=('len', 'min_row', 'input_file_path')):
     """
-    Note:
-        1.  The input arguments must be: id, pandas DataFrame object
-        2.  The return value must be a dictionary with string and DataFrame pair. The string (key) is used to name the
-            DataFrame during save
-    """
-    return {"dummy_result": pd.DataFrame(data=[1], columns=['a'])}
+    Note: both the input and output must be a list of tuples and the elements within each tuple must be: file_path,
+    chunk_id, DataFrame. Extra input arguments are allowed
 
+    The consistent input and output format allows function chaining
+    """
+    dfs = []
+    overall_path = []
+    for file_path, chunk_id, df in df_tuple_list:
+        overall_path.append(os.path.split(file_path)[1])
+        tmp_df = pd.DataFrame.from_dict({col_names[0]: len(df), col_names[1]: [df.index.min()],
+                                         col_names[2]: file_path})
+        dfs.append(tmp_df)
 
-def count_rows(id, df):
-    """
-    Just count the number of rows
-    """
-    sum_df = pd.DataFrame.from_dict({'id': [id], 'chunk_size': [len(df)], 'min_row': [df.index.min()]})
-    return {"summary_number_rows": sum_df}
+    return [(" & ".join(overall_path), df_tuple_list[0][1], pd.concat(dfs))]
 
 
 class ReadProcessByChunks(object):
     """
     Read and process large data file by chunks. A simple workload scheduler is implemented -- the main process reads
-    the chunks into the buffer; simultaneously, several child processes take the chunks out of the buffer and perform
-    user-defined data analysis. The results are collected from all child processes to form a complete summary
+    the chunks into the buffer queue; simultaneously, several child processes take the chunks out of the buffer and
+    perform user-defined data analysis. The results are collected from all child processes and form a complete summary
     
     Attributes:
-        self.head: read a few lines at the beginning (good for checking the number of columns or header strings)
-        self.run: start the read-process run 
-        self.save: save the summary files
+        self.run: start the read-process run
     """
     STOP_FLAG = 'STOP'
 
-    def __init__(self, file_path, file_pair_groupby_pattern=None, file_pair_sortby_pattern=None, dtype=None,
-                 chunk_size=1000, split_by=None, kwargs={}, n_buffered_chunks=-1, n_buffered_results=-1,
-                 func=None, func_kwargs={}, keep_rlt=False, post_process_func=None, post_func_kwargs={},
-                 save=True, save_path=None, hdf_format='table', n_jobs=-1, test_run=False):
+    def __init__(self, file_path, save_dir_path, purge_save_directory=False, save_mode=0, delayed_save=False,
+                 hdf_format='table', filegroup_groupby_pattern=None, filegroup_sortby_pattern=None, dtype=None,
+                 chunk_size=-1, chunk_by=None, chunking_inmemory=False, kwargs={}, n_buffered_chunks=-1,
+                 n_buffered_results=-1, func=None, func_kwargs={}, n_jobs=-1, chunk_limit=-1):
         """
         Arguments:
-            file_path: str, text or binary file
-                File path. Multiple files are supported with * wild card. Note if * is used, all files in the directory
-                with names matching the pattern will be processed
-            file_pair_groupby_pattern: bool, default=False
-                Pattern used to group files as pairs to be processed together. Note this option has no effect if
-                file_path points to a single file
-            file_pair_sortby_pattern: bool, default=False
-                This parameter should be used together with file_pair_groupby_pattern. It denotes the pattern used to
-                sort the files within the same group
+            file_path: str
+                File path(s). Multiple files are supported with * wild card. Note if * is used, all files in the
+                corresponding directory that matches the pattern will be processed
+            save_dir_path: str, default=None
+                Directory path to save the final summaries
+            purge_save_directory: bool, default=False
+                Whether or not the save directory should be deleted and recreated before saving the new results
+            save_mode: int, default=0
+                Determine how the final summary data should be saved. 0: by file and chunk, 1: by file only, else: by
+                None (all chunks from different files will be saved to one file)
+            delayed_save: bool, default=False
+                Determine whether or not the data should be preserved in memory and saved altogether before program
+                terminates. Using this option can improve the file saving efficiency especially when the individual
+                files to save are small. This option also removes the limit to save in 'fixed' hdf format since the
+                file is only saved once
+            hdf_format: str, options={'fixed', 'table'}, default='fixed'
+                This setting affects pd.to_hdf's table save format. Note 'fixed' does not support appending, hence
+                save_mode = 0 is always suggested with 'fixed' format is selected
+            filegroup_groupby_pattern: bool, default=None
+                Regular expression pattern used to group files into different sub-groups if multiple files are
+                requested to be processed
+            filegroup_sortby_pattern: bool, default=None
+                Used in conjunction with filegroup_groupby_pattern. This parameter specifies the regular expression
+                pattern to sort the files within sub-groups
             dtype: dict or numpy.dtype, default None
-                If a dictionary is passed, then it specifies the data types of columns of text files. This parameter
-                is passed to dtype argument of pd.read_csv. Note, due to some limits in pandas implementation, one
-                should avoid choosing 'category' to represent string columns, as this leads to concatenation errors.
-                Instead 'object' data type should be specified if a numpy.dtype object is passed, then it assumes the
-                input file is binary. It is used to parse each row of the binary file
-            chunk_size: int
-                The number of rows per chunk to read. Not used if file_path is a directory
-            split_by: column name, default=None
-                If specified, two read passes will be performed -- the first pass still reads the file in by the
-                specified chunk size, the program creates a summary based on this column. It then knows how many rows
-                should be read for each unique value of the split_by column. Note the split_by column selected must
-                have its value sorted in the entire data set. This parameter ensures the read does not break within the
-                section with the same split_by value
+                If a dictionary is passed, it specifies the column data types of text files (csv, txt). If numpy.dtypes
+                is passed, it specifies the column names and data types of binary files
+            chunk_size: int, default=-1
+                The number of rows per chunk to read
+            chunk_by: column name, default=None
+                This parameter specifies the column used as the guild line to split the file(s) to chunks. If not None,
+                two read passes will be performed. The first pass scans the file and creates a summary based on the
+                specified column. The summary specifies the variable chunk sizes while reading in the second pass.
+                This ensures rows with same values in the specified columns are read in as a whole without the risk of
+                being split across different chunks
+                Note: if both chunk_size == -1 and chunk_size_by is None, then file(s) will not be broken to chunks
+            chunking_inmemory: bool, default=False
+                If true, the file(s) will be read into memory as a whole and split into chunks afterward
             kwargs: dict, default={}
-                Keyword argument to pass to file reading functions
+                Keyword argument passed to file reading functions (pd.read_csv, pd.read_hdf, np.fromfile, etc.)
             n_buffered_chunks: int, default=-1
                 The number of buffered chunks in memory. If -1, then a value equals to 2 * n_jobs  is used
             n_buffered_results: int, default=-1
@@ -87,259 +100,75 @@ class ReadProcessByChunks(object):
                 dictionary with keys being the DataFrame names and values being the data frame objects
             func_kwargs: dict, default={}
                 Keywords to pass to the processing function
-            keep_rlt: bool, default=False
-                Whether or not the final result should be kept in the memory. It's convenient if the result needs to be
-                passed to another processing routine. Note: please watch the memory usage by yourself
-            post_process_func: function object to apply to the final result
-                Note if this parameter is not None, the final result will be preserved in the memory regardless of
-                keep_rlt setting. If it makes no difference applying the post process function to each chunk than the
-                entire final data set, it is advised to do it on each chunk. This avoids the need to preserving the
-                result in the memory
-            post_func_kwargs: dict, default={}
-                Keywords to pass to the post processing function
-            save: bool, default=True
-                Save the summary results
-            save_path: str, default=None
-                File or directory path to save the final summary. If None, then file_path will be used
-            hdf_format: str, options={'fixed', 'table'}, default='fixed'
-                This setting leads to pd.to_hdf's format paramter
             n_jobs: int, default=-1
                 Number of CPU cores to use. If -1, the value is set to number of cores - 1
-            test_run: boolean, default False
-                If True, then only the first chunk will be analyzed. This
-                feature is good for debugging purpose
+            chunk_limit: uint, default -1
+                The maximum number of chunks to process. If -1, then all chunks will be processed. It's convenient for
+                debugging purpose
         """
         self._start_time = time.time()
 
         # Memorize the settings
         self._file_path = file_path
-        self._file_pair_groupby_pattern = file_pair_groupby_pattern
-        self._file_pair_sortby_pattern = file_pair_sortby_pattern
+        self._save_mode = save_mode
+        self._hdf_format = hdf_format
+        self._delayed_save = delayed_save
+        self._filegroup_groupby_pattern = filegroup_groupby_pattern
+        self._filegroup_sortby_pattern = filegroup_sortby_pattern
         self._dtype = dtype
         self._chunk_size = chunk_size
-        self._split_by = split_by
+        self._chunk_by = chunk_by
+        self._chunking_inmemory = chunking_inmemory
         self._kwargs = kwargs
         self._n_jobs = cpu_count() - 1 if n_jobs == -1 else n_jobs
         self._n_buffered_chunks = 2 * self._n_jobs if n_buffered_chunks == -1 else n_buffered_chunks
         self._n_buffered_results = 2 * self._n_jobs if n_buffered_results == -1 else n_buffered_results
         self._func = func
         self._func_kwargs = func_kwargs
-        self._keep_rlt = keep_rlt
-        self._post_process_func = post_process_func
-        self._post_func_kwargs = post_func_kwargs
-        self._test_run = test_run
-        self._save = save
-        self._save_path = save_path if save_path is not None else file_path
-        self._hdf_format = hdf_format
-        self._rlt = {}
-        self._binary_file = None
-        self._log_mode = 'w'
-        self._prev_log_time = time.time()
+        self._chunk_limit = chunk_limit
+        self._save_dir_path = save_dir_path
 
-        if not os.path.exists(self._save_path):
-            os.makedirs(self._save_path)
+        # Create the log object
+        self._log = Log(os.path.join(self._save_dir_path, 'log.txt'), log_interval=10)
 
-    def head(self, n_lines=10):
-        """
-        Read a few lines from the target file. Note directory is not supported. This function should be used separately
-        """
-        with open(self._file_path) as f:
-            lines = [f.readline() for _ in range(n_lines)]
-        with open(self._file_path[:-4] + '_{}.{}'.format("head", self._file_path[-3:]), 'w') as f:
-            f.writelines(lines)
-
-    def _summarize_by_column(self, df):
-        df.reset_index(inplace=True)
-        df = pd.pivot_table(df, index=self._split_by, values='index',
-                            aggfunc=(len, min))
-        return df
-
-    def _merge(self, dfs):
-        if dfs is None or len(dfs) == 0:
-            return
-
-        return self._merge_helper(dfs, 0, len(dfs) - 1)
-
-    def _merge_helper(self, dfs, start, end):
-        if start == end:
-            return dfs[start]
-
-        mid = start + (end - start) // 2
-        left = self._merge_helper(dfs, start, mid)
-        right = self._merge_helper(dfs, mid + 1, end)
-        return self._merge_two(left, right)
-
-    @staticmethod
-    def _merge_two(left, right):
-        df = pd.merge(left, right, how='outer', left_index=True,
-                      right_index=True, suffixes=('_l', '_r'))
-        df[['len_l', 'len_r']] = df[['len_l', 'len_r']].fillna(0)
-        df[['min_l', 'min_r']] = df[['min_l', 'min_r']].fillna(float('inf'))
-        df['len'] = df['len_l'] + df['len_r']
-        df['min'] = np.minimum(df['min_l'], df['min_r'])
-        return df[['len', 'min']].astype(np.intc)
-
-    def _create_chunks(self):
-        # Multiple files
-        if '*' in self._file_path:
-            directory, file_name = os.path.split(self._file_path)
-            self._files = glob.glob(os.path.join(directory, "**", file_name), recursive=True)
-        # Single files
+        if not os.path.exists(self._save_dir_path):
+            os.makedirs(self._save_dir_path)
         else:
-            if self._file_path[-4:] == '.bin':
-                self._create_chunks_binary()
-            elif self._file_path[-4:] in {'.txt', '.csv'}:
-                self._create_chunks_non_binary()
-            elif self._file_path[-3:] == '.h5':
-                self._create_chunks_non_binary()
-
-    def _create_chunks_binary(self):
-        """
-        Read the binary file. Note this function does not automatically split it to chunks
-        """
-        self._binary_file = open(self._file_path, 'rb')
-
-    def _create_chunks_non_binary(self):
-        """
-        Create chunks for the text file. Note if a split-by column is specified. The program will first count
-        the number of rows corresponding to each entry in the split-by column. The correct number of rows will
-        be read during the actual data processing step
-        """
-        if self._file_path[-4:] in {'.txt', '.csv'}:
-            self._chunks = pd.read_csv(self._file_path, chunksize=self._chunk_size, dtype=self._dtype, **self._kwargs)
-        elif self._file_path[-3:] == '.h5':
-            self._chunks = pd.read_hdf(self._file_path, chunksize=self._chunk_size, **self._kwargs)
-        if self._split_by is not None:
-            msg = "Build the summary based on the split-by column ..."
-            self._log_and_print(self._log_queue, msg)
-            dfs = []
-            for chunk in self._chunks:
-                df = self._summarize_by_column(chunk)
-                dfs.append(df)
-            self.split_by_sum_df = self._merge(dfs)
-            self.split_by_sum_df.sort_values(by='min', inplace=True)
-            if self._file_path[-4:] in {'.txt', '.csv'}:
-                self._reader = pd.read_csv(self._file_path, iterator=True, dtype=self._dtype, **self._kwargs)
-            elif self._file_path[-3:] == '.h5':
-                self._reader = pd.read_hdf(self._file_path, iterator=True, **self._kwargs)
+            if purge_save_directory:
+                shutil.rmtree(self._save_dir_path)
+                os.makedirs(self._save_dir_path)
 
     def _create_reader_thread(self):
         self._th_reader = Thread(target=self._read_chunks_to_queue)
         self._th_reader.start()
         
     def _read_chunks_to_queue(self):
-        if '*' in self._file_path:
-            if self._file_pair_groupby_pattern is None or self._file_pair_sortby_pattern is None:
-                self._read_single_file_to_queue()
-            else:
-                self._read_file_pairs_to_queue()
-        else:
-            if self._file_path[-4:] == '.bin':
-                self._read_chunks_to_queue_binary()
-            elif self._file_path[-4:] in {'.txt', '.csv'}:
-                self.read_chunks_to_queue_non_binary()
-            elif self._file_path[-3:] == '.h5':
-                self.read_chunks_to_queue_non_binary()
+        chunk_it = Reader(self._file_path, self._filegroup_groupby_pattern, self._filegroup_sortby_pattern, 
+                          self._dtype, self._chunk_size, self._chunk_by, self._chunking_inmemory, self._kwargs,
+                          self._log).chunk_iterator()
+        try:
+            chunk_id = 0
+            while True:
+                # Wait for the chunk queue to dissipate
+                while self._chunk_queue.qsize() >= self._n_buffered_chunks:
+                    time.sleep(0.01)
+                self._chunk_queue.put(next(chunk_it))
+                chunk_id += 1
+                if chunk_id >= self._chunk_limit > 0:
+                    raise StopIteration
+        except StopIteration:
+            pass
+        
         # Signal the workers to stop
         for _ in range(self._n_jobs):
             self._chunk_queue.put(self.STOP_FLAG)
-
-    def _read_single_file_to_queue(self):
-        for id, file_path in enumerate(self._files):
-            while self._chunk_queue.qsize() >= self._n_buffered_chunks:
-                time.sleep(0.01)
-            # Keep last two levels of file paths
-            dir_name, file_name_1 = os.path.split(file_path)
-            _, file_name_2 = os.path.split(dir_name)
-            # Combine id and file_name
-            id = "{}, {}".format(id, os.path.join(file_name_2, file_name_1))
-            chunk = self._read_single_file(file_path)
-            if chunk is None:
-                continue
-            self._chunk_queue.put((id, chunk))
-            if self._test_run:
-                break
-
-    def _read_file_pairs_to_queue(self):
-        file_pairs = self._get_file_pairs()
-        for key, val in file_pairs.items():
-            while self._chunk_queue.qsize() >= self._n_buffered_chunks:
-                time.sleep(0.01)
-            chunk_pairs = []
-            for id, file_path in val:
-                chunk_pairs.append(self._read_single_file(file_path))
-            self._chunk_queue.put((key, chunk_pairs))
-            if self._test_run:
-                break
-
-    def _get_file_pairs(self):
-        dic = {}
-        for file in self._files:
-            key = re.search(self._file_pair_groupby_pattern, file)
-            identifier = re.search(self._file_pair_sortby_pattern, file)
-            try:
-                key, identifier = key.group(), identifier.group()
-                if key not in dic:
-                    dic[key] = [(identifier, file)]
-                else:
-                    dic[key].append((identifier, file))
-            except AttributeError:
-                error_msg = "AttributeError: Key or identifier is not found in file".format(file)
-                self._log_and_print(self._log_queue, error_msg)
-
-        for key in dic:
-            dic[key] = sorted(dic[key], key=lambda x: x[0])
-
-        return dic
-
-    def _read_single_file(self, file_path):
-        if file_path[-4:] == '.bin':
-            with open(file_path, 'rb') as f:
-                return pd.DataFrame(np.fromfile(f, dtype=self._dtype))
-        elif file_path[-4:] in {'.txt', '.csv'}:
-            return pd.read_csv(file_path, dtype=self._dtype, **self._kwargs)
-        elif file_path[-3:] == '.h5':
-            return pd.read_hdf(file_path, **self._kwargs)
-        else:
-            return
-
-    def read_chunks_to_queue_non_binary(self):
-        if self._split_by is None:
-            for id, chunk in enumerate(self._chunks):
-                while self._chunk_queue.qsize() >= self._n_buffered_chunks:
-                    time.sleep(0.01)
-                self._chunk_queue.put((id, chunk))
-                if self._test_run:
-                    break
-        else:
-            for id, chunk_size in enumerate(self.split_by_sum_df['len']):
-                while self._chunk_queue.qsize() >= self._n_buffered_chunks:
-                    time.sleep(0.01)
-                self._chunk_queue.put((id, self._reader.get_chunk(chunk_size)))
-                if self._test_run:
-                    break
-
-    def _read_chunks_to_queue_binary(self):
-        id = 0
-        while True:
-            while self._chunk_queue.qsize() >= self._n_buffered_chunks:
-                time.sleep(0.01)
-            # No seek needed
-            chunk = pd.DataFrame(np.fromfile(self._binary_file, dtype=self._dtype, count=self._chunk_size))
-            if len(chunk) <= 0:
-                break
-            self._chunk_queue.put((id, chunk))
-            if self._test_run:
-                break
-            id += 1
-
+            
     def _create_queues(self):
         # Need to use multiprocessing.Manager, the Queue() is buggy and causes
         # deadlock
         manager = Manager()
         self._chunk_queue = manager.Queue()
         self._result_queue = manager.Queue()
-        self._log_queue = manager.Queue()
 
     def _create_processes(self):
         self._processes = []
@@ -352,13 +181,13 @@ class ReadProcessByChunks(object):
                 'chunk_queue': self._chunk_queue,
                 'result_queue': self._result_queue,
                 'n_buffered_results': self._n_buffered_results,
-                'log_queue': self._log_queue})
+                'log': self._log})
             self._processes.append(proc)
             proc.start()
 
     @classmethod
-    def _process_queue(cls, process_id, stop_flag, func, func_kwargs, chunk_queue, result_queue, n_buffered_results,
-                       log_queue):
+    def _process_queue(cls, process_id, stop_flag, func, func_kwargs, chunk_queue, result_queue, n_buffered_results, 
+                       log):
         while True:
             if chunk_queue.qsize() <= 0 or result_queue.qsize() > n_buffered_results:
                 time.sleep(0.01)
@@ -366,24 +195,22 @@ class ReadProcessByChunks(object):
             data = chunk_queue.get()
             if data == stop_flag:
                 break
-            id, chunk = data
-            msg = "Processing id = {}. Number of data and result chunks in memory: {}, {}".format(id, 
-                                                                                                  chunk_queue.qsize(), 
-                                                                                                  result_queue.qsize())
-            cls._log_and_print(log_queue, msg)
+            msg = "Processing fn(1st)='{}', ch={}. # of data and result chunks in memory: {}, {}".format(data[0][0],
+                                                                                                         data[0][1],
+                                                                                                         chunk_queue.qsize(),
+                                                                                                         result_queue.qsize())
+            log.put(msg)
             if func is None:
                 continue
             try:
-                data = func(id, chunk, **func_kwargs)
+                result = func(data, **func_kwargs)
+                result_queue.put(result)
             except Exception as e:
                 error_msg = ("Error has occurred to chunk id = {}. Process continues to the next chunk. "
                              "Error message: {}".format(id, e))
-                cls._log_and_print(log_queue, error_msg)
-                data = None
-            if data is not None:
-                result_queue.put(data)
+                log.put(error_msg)
         msg = "Worker {} is done!".format(process_id)
-        cls._log_and_print(log_queue, msg)
+        log.put(msg)
 
     def _create_saver_thread(self):
         self._th_saver = Thread(target=self._save_queue_to_disk)
@@ -394,11 +221,12 @@ class ReadProcessByChunks(object):
         Save the final results to the disk. Note there are two approaches to save the results, depending on whether or
         not the post processing function is applied or not. Only hdf file format is supported
         """
-        save_path = self._save_path
+        if self._save_dir_path is None:
+            return
         n_proc_alive = float('inf')
         just_started = True
+        df_dic = {}
         mode = 'w'
-        initial_write = True
 
         # Keep working if there're any live data analysis processes or any unsaved items in the queue
         while just_started or n_proc_alive > 0 or self._result_queue.qsize() > 0:
@@ -410,90 +238,75 @@ class ReadProcessByChunks(object):
                     just_started = False
 
             # Write logs
-            self._write_log()
+            self._log.write()
 
             # Write results
             if self._result_queue.qsize() > 0:
-                data = self._result_queue.get()
-                if self._save and self._post_process_func is None:
-                    for key in data:
-                        if len(data[key]):
-                            slash_pos = key.find('\\')
-                            if slash_pos > 0:
-                                file_path = os.path.join(save_path, '{}.h5'.format(key[slash_pos + 1:]))
-                            else:
-                                file_path = os.path.join(save_path, '{}.h5'.format(key))
-                            if os.path.isfile(file_path) and not initial_write:
-                                mode = 'a'
-                            append = True if self._hdf_format == 'table' and '*' not in self._file_path else False
-                            data[key].to_hdf(file_path, key='summary', format=self._hdf_format, mode=mode,
-                                             data_columns=True, append=append)
-                            initial_write = False
-                            msg = "Attn: summary file is saved at: {}".format(file_path)
-                            self._log_and_print(self._log_queue, msg)
-                if self._keep_rlt or (self._save and self._post_process_func is not None):
-                    if len(self._rlt) == 0:
-                        for key in data:
-                            self._rlt[key] = []
-                    for key in data:
-                        if len(data[key]):
-                            self._rlt[key].append(data[key])
+                for summary_id, data in enumerate(self._result_queue.get()):
+                    if data is None:
+                        continue
+                    file_path, chunk_id, df = data
+                    if len(df) == 0:
+                        continue
+                    hdf_kwargs = {}
+                    file_save_path = os.path.join(self._save_dir_path, file_path)
+                    if self._save_mode == 0:
+                        file_save_path += ', ch={}, sum_id={}.h5'.format(summary_id, chunk_id)
+                    elif self._save_mode == 1:
+                        file_save_path += ', sum_id={}.h5'.format(summary_id)
+                        df['_chunk_id'] = chunk_id
+                    else:
+                        file_save_path = os.path.join(self._save_dir_path, 'sum_id={}.h5'.format(summary_id))
+                        df['_file_path'] = file_path
+                        df['_chunk_id'] = chunk_id
+                        hdf_kwargs['min_itemsize'] = {'_file_path': 128}
+                    if self._delayed_save:
+                        if file_save_path not in df_dic:
+                            df_dic[file_save_path] = []
+                        df_dic[file_save_path].append(df)
+                    else:
+                        self._save(file_save_path, df, hdf_kwargs, mode=mode)
+                    self._log.put("Attn: summary file is saved at: {}".format(file_save_path))
+                mode = 'a'
 
-        # Save after applying post function
-        if self._keep_rlt or (self._save and self._post_process_func is not None):
-            for key in self._rlt:
-                self._rlt[key] = pd.concat(self._rlt[key]) if len(self._rlt[key]) > 0 else pd.DataFrame()
-                if self._post_process_func is not None:
-                    self._rlt[key] = self._post_process_func(self._rlt[key], **self._post_func_kwargs)
-                if self._save:
-                    if len(self._rlt[key]):
-                        file_path = os.path.join(save_path, '{}.h5'.format(key))
-                        self._rlt[key].to_hdf(file_path, key='summary', format=self._hdf_format, mode='w',
-                                              data_columns=True)
-                        msg = "Attn: summary file is saved at: {}".format(file_path)
-                        self._log_and_print(self._log_queue, msg)
+        # Delayed save
+        for file_save_path, dfs in df_dic.items():
+            df = pd.concat(dfs)
+            self._save(file_save_path, df, mode='w')
 
-    def _write_log(self, log_interval=10):
+    def _save(self, file_save_path, df, hdf_kwargs={}, mode='a'):
+        """
+        Save an individual file
+        """
+        self._create_directories(file_save_path)
+        append = True if self._hdf_format == 'table' else False
+        df.to_hdf(file_save_path, key='summary', format=self._hdf_format, mode=mode, data_columns=True, append=append,
+                  **hdf_kwargs)
 
-        # Skip if the previous save is less than 10s ago
-        curr_time = time.time()
-        if curr_time - self._prev_log_time < log_interval:
-            return
-        self._prev_log_time = curr_time
-
-        # Save the logs
-        log = []
-        while self._log_queue.qsize() > 0:
-            log.append(self._log_queue.get() + '\n')
-        with open(os.path.join(self._save_path, "log.txt"), self._log_mode) as log_f:
-            log_f.writelines(log)
-        self._log_mode = 'a'
+    def _create_directories(self, file_save_path):
+        """
+        Create all required parent directories associated with file_save_path
+        """
+        dir_path = os.path.split(file_save_path)[0]
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
 
     def _close(self):
         # Close file if necessary
         self._th_saver.join()
-        if self._binary_file is not None:
-            self._binary_file.close()
 
         # Print the total run time
         msg = "Done! Total processing time: {:.0f} s".format(time.time() - self._start_time)
-        self._log_and_print(self._log_queue, msg)
+        self._log.put(msg)
 
         # Save the log
-        self._write_log(log_interval=0)
-
-    @classmethod
-    def _log_and_print(cls, log_queue, msg):
-        msg = '<{}> {}'.format(datetime.now(), msg)
-        print(msg)
-        log_queue.put(msg)
+        self._log.write(log_interval=0)
 
     def run(self):
         """
         Run the analysis
         """
         self._create_queues()
-        self._create_chunks()
         self._create_reader_thread()
         self._create_processes()
         self._create_saver_thread()
@@ -501,7 +314,64 @@ class ReadProcessByChunks(object):
 
 
 if __name__ == '__main__':
-    # A test run
-    file_path = r'tmp.csv'
-    s = ReadProcessByChunks(file_path)
+    # A few test runs
+    import shutil
+
+    # print("\nSingle file read as a whole:")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\test_set1 - 1st_fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, func=count_rows, hdf_format='table')
+    # s.run()
+
+    # print("\nSingle file by chunk size:")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\test_set1 - 1st_fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, chunk_size=3, func=count_rows, hdf_format='table')
+    # s.run()
+
+    # print("\nMultiple files (each file is read in in intact):")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\*fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, func=count_rows, hdf_format='table')
+    # s.run()
+
+    # print("\nMultiple file (each file is broken to chunks of fixed sizes):")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\*fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, chunk_size=3, func=count_rows, hdf_format='table')
+    # s.run()
+
+    # print("\nMultiple file (each file is broken to chunks by a certain column):")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\*fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, chunk_by='group', func=count_rows, hdf_format='table')
+    # s.run()
+
+    # print("\nMultiple file (with grouping, each file is broken to chunks by a certain column):")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\*fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, filegroup_groupby_pattern="_set\d+",
+    #                         filegroup_sortby_pattern="\d\w+.h5", chunk_by='group', func=count_rows, hdf_format='table')
+    # s.run()
+
+    # print("\nTest save by file only:")
+    # file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\*fixed.h5'
+    # save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    # shutil.rmtree(save_dir_path)
+    # s = ReadProcessByChunks(file_path, save_dir_path, save_mode=1, filegroup_groupby_pattern="_set\d+",
+    #                         filegroup_sortby_pattern="\d\w+.h5", chunk_by='group', func=count_rows, hdf_format='table')
+    # s.run()
+
+    print("\nTest save by none (save everything in one file):")
+    file_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set\*fixed.h5'
+    save_dir_path = r'C:\Users\justin.duan\Documents\Projects\Chip data\Chip_test_scripts - dev\test_data_set_summary'
+    shutil.rmtree(save_dir_path)
+    s = ReadProcessByChunks(file_path, save_dir_path, save_mode=2, filegroup_groupby_pattern="_set\d+",
+                            filegroup_sortby_pattern="\d\w+.h5", chunk_by='group', func=count_rows, hdf_format='table')
     s.run()
