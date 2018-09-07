@@ -18,8 +18,8 @@ class Reader:
         1) single file broken into chunks of fixed or variable sizes (chunk size controlled by specific columns)
         2) multiple files. Each file is read into memory as a whole
         3) multiple files. Each file is broken to chunks of fixed or variable sizes
-        4) multiple files. Files are grouped to different groups with each group read into memory together with breaking
-           into chunks
+        4) multiple files. Files are grouped to different groups with each group read into memory simultaneously with
+           no file breaking into chunks
         5) multiple files. Same as 4) but files within each group are broken to chunks of fixed or variable sizes
 
     Note: in case that multiple files are requested to be broken to chunks. The program will try to break each file to

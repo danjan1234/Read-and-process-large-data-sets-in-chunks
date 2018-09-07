@@ -3,6 +3,14 @@ A simple workload scheduler that reads and processes large data files simultaneo
 
 Author: Justin Duan
 Time: 2018/08/31 3:20PM
+
+Object design:
+    Log: takes care of log file writing, log queue maintenance, as wall as message printing
+
+    Reader: takes care of various file input scenarios. No matter how complicated the situation is, it supplies a
+    chunk iterator that outputs one chunk at a time
+
+    ReadProcessByChunks: main class
 """
 
 import shutil
