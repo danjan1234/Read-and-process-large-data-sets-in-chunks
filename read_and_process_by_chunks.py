@@ -2,7 +2,7 @@
 A simple workload scheduler that reads and processes large data files simultaneously by chunks
 
 Author: Justin Duan
-Time: 2018/08/31 3:20PM
+Time: 2018/09/12 3:25PM
 
 Object design:
     Log: takes care of log file writing, log queue maintenance, as wall as message printing
@@ -144,6 +144,7 @@ class ReadProcessByChunks(object):
         else:
             if purge_save_directory:
                 shutil.rmtree(self._save_dir_path)
+                time.sleep(1)
                 os.makedirs(self._save_dir_path)
 
     def _create_reader_thread(self):
@@ -165,7 +166,8 @@ class ReadProcessByChunks(object):
                 if chunk_id >= self._chunk_limit > 0:
                     raise StopIteration
         except StopIteration:
-            pass
+            msg = "Reached the end of chunks"
+            self._log.put(msg)
         
         # Signal the workers to stop
         for _ in range(self._n_jobs):
@@ -203,10 +205,8 @@ class ReadProcessByChunks(object):
             data = chunk_queue.get()
             if data == stop_flag:
                 break
-            msg = "Processing fn(1st)='{}', ch={}. # of data and result chunks in memory: {}, {}".format(data[0][0],
-                                                                                                         data[0][1],
-                                                                                                         chunk_queue.qsize(),
-                                                                                                         result_queue.qsize())
+            msg = "Processing filename (1st)='{}', ch={}. # of data and result chunks in memory: {}, {}".format(
+                data[0][0], data[0][1], chunk_queue.qsize(), result_queue.qsize())
             log.put(msg)
             if func is None:
                 continue
@@ -214,8 +214,8 @@ class ReadProcessByChunks(object):
                 result = func(data, **func_kwargs)
                 result_queue.put(result)
             except Exception as e:
-                error_msg = ("Error has occurred to chunk id = {}. Process continues to the next chunk. "
-                             "Error message: {}".format(id, e))
+                error_msg = ("Error has occurred to filename (1st)='{}', ch={}. Process continues to the next chunk. "
+                             "Error message: {}".format(data[0][0], data[0][1], e))
                 log.put(error_msg)
         msg = "Worker {} is done!".format(process_id)
         log.put(msg)
