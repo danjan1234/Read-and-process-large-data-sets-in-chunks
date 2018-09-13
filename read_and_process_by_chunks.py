@@ -2,7 +2,7 @@
 A simple workload scheduler that reads and processes large data files simultaneously by chunks
 
 Author: Justin Duan
-Time: 2018/09/12 3:25PM
+Time: 2018/09/13 12:05PM
 
 Object design:
     Log: takes care of log file writing, log queue maintenance, as wall as message printing
@@ -56,7 +56,7 @@ class ReadProcessByChunks(object):
     def __init__(self, file_path, save_dir_path, purge_save_directory=False, save_mode=0, delayed_save=False,
                  hdf_format='table', filegroup_groupby_pattern=None, filegroup_sortby_pattern=None, dtype=None,
                  chunk_size=-1, chunk_by=None, chunking_inmemory=False, kwargs={}, n_buffered_chunks=-1,
-                 n_buffered_results=-1, func=None, func_kwargs={}, n_jobs=-1, chunk_limit=-1):
+                 n_buffered_results=-1, func=None, func_kwargs={}, n_jobs=-1, chunk_limit=-1, sum_prefix='sum'):
         """
         Arguments:
             file_path: str
@@ -67,7 +67,7 @@ class ReadProcessByChunks(object):
             purge_save_directory: bool, default=False
                 Whether or not the save directory should be deleted and recreated before saving the new results
             save_mode: int, default=0
-                Determine how the final summary data should be saved. 0: by file and chunk, 1: by file only, else: by
+                Determine how the final summary data should be saved. 0: by file and chunk; 1: by file only; 2: by
                 None (all chunks from different files will be saved to one file)
             delayed_save: bool, default=False
                 Determine whether or not the data should be preserved in memory and saved altogether before program
@@ -113,6 +113,7 @@ class ReadProcessByChunks(object):
             chunk_limit: uint, default -1
                 The maximum number of chunks to process. If -1, then all chunks will be processed. It's convenient for
                 debugging purpose
+            :sum_prefix: str, default='sum_'. Prefix string for the summary files
         """
         self._start_time = time.time()
 
@@ -135,6 +136,7 @@ class ReadProcessByChunks(object):
         self._func_kwargs = func_kwargs
         self._chunk_limit = chunk_limit
         self._save_dir_path = save_dir_path
+        self._sum_prefix = sum_prefix
 
         # Create the log object
         self._log = Log(os.path.join(self._save_dir_path, 'log.txt'), log_interval=10)
@@ -250,7 +252,10 @@ class ReadProcessByChunks(object):
 
             # Write results
             if self._result_queue.qsize() > 0:
-                for summary_id, data in enumerate(self._result_queue.get()):
+                queue_data = self._result_queue.get()
+                if queue_data is None:
+                    continue
+                for summary_id, data in enumerate(queue_data):
                     if data is None:
                         continue
                     file_path, chunk_id, df = data
@@ -259,12 +264,13 @@ class ReadProcessByChunks(object):
                     hdf_kwargs = {}
                     file_save_path = os.path.join(self._save_dir_path, file_path)
                     if self._save_mode == 0:
-                        file_save_path += ', ch={}, sum_id={}.h5'.format(summary_id, chunk_id)
+                        file_save_path += ', ch={}, {}_id={}.h5'.format(chunk_id, self._sum_prefix, summary_id)
                     elif self._save_mode == 1:
-                        file_save_path += ', sum_id={}.h5'.format(summary_id)
+                        file_save_path += ', {}_id={}.h5'.format(self._sum_prefix, summary_id)
                         df['_chunk_id'] = chunk_id
                     else:
-                        file_save_path = os.path.join(self._save_dir_path, 'sum_id={}.h5'.format(summary_id))
+                        file_save_path = os.path.join(self._save_dir_path, '{}_id={}.h5'.format(self._sum_prefix,
+                                                                                                summary_id))
                         df['_file_path'] = file_path
                         df['_chunk_id'] = chunk_id
                         hdf_kwargs['min_itemsize'] = {'_file_path': 128}
