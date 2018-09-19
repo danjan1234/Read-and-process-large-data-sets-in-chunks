@@ -1,0 +1,27 @@
+<2018/9/19 15:49:8> 
+<2018/9/19 15:49:8> #### Log starts ####
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:9> Build the summary based on the split-by column ...
+<2018/9/19 15:49:10> Reached the end of chunks
+<2018/9/19 15:49:11> Processing filename (1st)='test_set1 - 1st_fixed.h5', ch=0. # of data and result chunks in memory: 10, 0
+<2018/9/19 15:49:11> Processing filename (1st)='test_set1 - 1st_fixed.h5', ch=1. # of data and result chunks in memory: 9, 0
+<2018/9/19 15:49:11> Processing filename (1st)='test_set2 - 1st_fixed.h5', ch=0. # of data and result chunks in memory: 8, 1
+<2018/9/19 15:49:11> Processing filename (1st)='test_set2 - 1st_fixed.h5', ch=1. # of data and result chunks in memory: 7, 1
+<2018/9/19 15:49:11> Worker 1 is done!
+<2018/9/19 15:49:11> Worker 0 is done!
+<2018/9/19 15:49:11> Worker 2 is done!
+<2018/9/19 15:49:11> Worker 3 is done!
+<2018/9/19 15:49:11> Worker 4 is done!
+<2018/9/19 15:49:11> Worker 5 is done!
+<2018/9/19 15:49:11> Worker 6 is done!
+<2018/9/19 15:49:11> Attn: summary file is saved at: ..\test_data\test_data_set_summary\sum_id=0.h5
+<2018/9/19 15:49:11> Attn: summary file is saved at: ..\test_data\test_data_set_summary\sum_id=0.h5
+<2018/9/19 15:49:11> Attn: summary file is saved at: ..\test_data\test_data_set_summary\sum_id=0.h5
+<2018/9/19 15:49:11> Attn: summary file is saved at: ..\test_data\test_data_set_summary\sum_id=0.h5
+<2018/9/19 15:49:11> Done! Total processing time: 5 s

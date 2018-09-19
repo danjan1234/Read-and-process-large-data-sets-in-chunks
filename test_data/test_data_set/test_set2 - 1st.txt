@@ -1,0 +1,9 @@
+id	name	group
+0	a	2
+1	b	2
+2	c	2
+3	d	1
+4	a	1
+5	b	1
+6	c	1
+7	d	1
